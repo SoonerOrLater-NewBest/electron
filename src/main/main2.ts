@@ -9,14 +9,11 @@
  * `./src/main.js` using webpack. This gives us some performance wins.
  */
 import path from 'path';
-import { app, BrowserWindow, shell, ipcMain, session } from 'electron';
+import { app, BrowserWindow, shell, ipcMain } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
-import Datastore from 'nedb';
-import { parse } from 'url';
-import { stringify } from 'querystring';
 
 class AppUpdater {
   constructor() {
@@ -27,23 +24,6 @@ class AppUpdater {
 }
 
 let mainWindow: BrowserWindow | null = null;
-
-// Initialize NeDB database for caching
-const cacheDb = new Datastore<{ key: string; data: any }>({
-  filename: 'cache.db',
-  autoload: true,
-});
-
-/**
- * Generate a unique cache key using URL path and query parameters.
- */
-const generateCacheKey = (
-  pathname: string,
-  queryParams: Record<string, string>,
-): string => {
-  const queryString = stringify(queryParams);
-  return `${pathname}?${queryString}`;
-};
 
 ipcMain.on('ipc-example', async (event, arg) => {
   const msgTemplate = (pingPong: string) => `IPC test: ${pingPong}`;
@@ -101,7 +81,7 @@ const createWindow = async () => {
     },
   });
 
-  mainWindow.loadURL('http://www.baidu.com');
+  mainWindow.loadURL(resolveHtmlPath('index.html'));
 
   mainWindow.on('ready-to-show', () => {
     if (!mainWindow) {
@@ -130,70 +110,6 @@ const createWindow = async () => {
   // Remove this if your app does not use auto updates
   // eslint-disable-next-line
   new AppUpdater();
-
-  // Intercept and cache network requests
-  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
-    const { url: requestUrl } = details;
-    const parsedUrl = parse(requestUrl, true);
-
-    if (!parsedUrl.pathname) {
-      callback({});
-      return;
-    }
-
-    const cacheKey = generateCacheKey(parsedUrl.pathname, parsedUrl.query);
-
-    // Check for cached data
-    cacheDb.findOne({ key: cacheKey }, (err, doc) => {
-      if (err) {
-        console.error('Cache query error:', err);
-        callback({});
-        return;
-      }
-
-      if (doc) {
-        console.log('Cache hit:', requestUrl);
-        // Respond with cached data
-        callback({ cancel: true });
-
-        // Send cached data back to renderer process
-        if (mainWindow) {
-          mainWindow.webContents.send('cached-response', doc.data);
-        }
-      } else {
-        console.log('Cache miss:', requestUrl);
-        callback({});
-
-        session.defaultSession.webRequest.onCompleted((responseDetails) => {
-          if (
-            responseDetails.url === requestUrl &&
-            responseDetails.statusCode === 200
-          ) {
-            // Cache response data
-            const responseBody = Buffer.from(
-              responseDetails.uploadData?.[0]?.bytes || '',
-            );
-            cacheDb.insert(
-              {
-                key: cacheKey,
-                data: {
-                  headers: responseDetails.responseHeaders,
-                  body: responseBody.toString(),
-                },
-              },
-              (insertErr) => {
-                if (insertErr) {
-                  console.error('Failed to cache response:', insertErr);
-                } else {
-                  console.log('Response cached for:', requestUrl);
-                }
-              },
-            );
-          }
-        });
-      }
-    });
-  });
 };
 
 /**

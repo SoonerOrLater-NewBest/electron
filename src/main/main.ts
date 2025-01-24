@@ -1,5 +1,5 @@
 import path from 'path';
-import { app, BrowserWindow, session } from 'electron';
+import { app, BrowserWindow, session, protocol } from 'electron';
 import Datastore from 'nedb';
 import { parse } from 'url';
 import { stringify } from 'querystring';
@@ -84,10 +84,24 @@ const createWindow = async () => {
       console.error('Navigation failed:', validatedURL, errorDescription);
     },
   );
+  // 注册 file:// 协议拦截器
+  protocol.registerFileProtocol('file', (request, callback) => {
+    const url = request.url.substr(7); // 去掉 "file://"
+    const filePath = path.normalize(decodeURIComponent(url)); // 解码路径并标准化
+    console.log('Serving file:', filePath);
+
+    // 返回文件路径
+    callback({ path: filePath });
+  });
 
   // 设置网络拦截器
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     const { url } = details;
+    // 忽略非 http/https 请求
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      callback({});
+      return;
+    }
     const parsedUrl = parse(url || '', true);
 
     if (!parsedUrl.pathname) {

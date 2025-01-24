@@ -16,15 +16,6 @@ const cacheDb = new Datastore<{
   autoload: true,
 });
 
-// 生成唯一缓存键
-const generateCacheKey = (
-  pathname: string,
-  queryParams: Record<string, string>,
-): string => {
-  const queryString = stringify(queryParams);
-  return `${pathname}?${queryString}`;
-};
-
 const createWindow = async () => {
   mainWindow = new BrowserWindow({
     show: false,
@@ -90,76 +81,57 @@ const createWindow = async () => {
     const filePath = path.normalize(decodeURIComponent(url)); // 解码路径并标准化
     console.log('Serving file:', filePath);
 
-    // 返回文件路径
     callback({ path: filePath });
   });
-  const filter = {
-    urls: ['*://*/*'], // 过滤所有请求
-  };
+
+  // 缓存文件目录
+  const CACHE_DIR = path.join(app.getPath('userData'), 'cache');
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+
+  // 生成缓存键
+  const generateCacheKey = (pathname: string, query: Record<string, any>) =>
+    `${pathname}?${new URLSearchParams(query).toString()}`;
 
   // 设置网络拦截器
   session.defaultSession.webRequest.onBeforeRequest(
-    filter,
+    { urls: ['*://*/*'] },
     (details, callback) => {
-      const { url } = details;
-      // 忽略非 http/https 请求
+      const { url, resourceType } = details;
+
+      // 忽略非 HTTP/HTTPS 请求
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
         callback({});
         return;
       }
-      // 不拦截主页面加载请求（通常是 HTML 文档）
-      if (details.resourceType === 'mainFrame') {
-        callback({}); // 允许直接加载
+
+      // 不拦截主页面加载请求
+      if (resourceType === 'mainFrame') {
+        callback({});
         return;
       }
-      const parsedUrl = parse(url || '', true);
 
+      const parsedUrl = parse(url || '', true);
       if (!parsedUrl.pathname) {
         callback({});
         return;
       }
-      // // 拦截接口请求（例如以 /api 开头）
-      // if (url.includes('/api')) {
-      //   console.log('Intercepting API request:', url);
-      //   // 自定义逻辑（缓存、重定向等）
-      //   callback({});
-      //   return;
-      // }
-
-      // // 拦截静态资源请求（CSS、图片等）
-      // if (/\.(css|js|png|jpe?g|gif|svg|woff2?|ttf|eot|ico)$/i.test(url)) {
-      //   console.log('Intercepting static resource:', url);
-      //   // 自定义逻辑（缓存、重定向等）
-      //   callback({});
-      //   return;
-      // }
 
       const cacheKey = generateCacheKey(parsedUrl.pathname, parsedUrl.query);
+      const cachePath = path.join(
+        CACHE_DIR,
+        `${cacheKey.replace(/[^a-z0-9]/gi, '_')}`,
+      );
 
-      // 查找缓存
-      cacheDb.findOne({ key: cacheKey }, (err, doc) => {
-        if (err) {
-          console.error('Cache query error:', err);
-          callback({});
-          return;
-        }
-
-        if (doc) {
-          // 缓存命中 - 伪造响应
-          console.log('Cache hit:', url);
-
-          const localPath = path.join(
-            app.getPath('userData'),
-            `${cacheKey.replace(/[^a-z0-9]/gi, '_')}.html`,
-          );
-          fs.writeFileSync(localPath, doc.data.body); // 写入缓存到本地文件
-
-          callback({ cancel: true, redirectURL: `file://${localPath}` }); // 使用本地文件作为响应
-        } else {
-          console.log('Cache miss:', url);
-          callback({});
-        }
-      });
+      // 检查缓存
+      if (fs.existsSync(cachePath)) {
+        console.log('Cache hit:', url);
+        callback({ cancel: true, redirectURL: `file://${cachePath}` }); // 使用本地缓存文件
+      } else {
+        console.log('Cache miss:', url);
+        callback({});
+      }
     },
   );
 
@@ -167,6 +139,7 @@ const createWindow = async () => {
   session.defaultSession.webRequest.onCompleted((details) => {
     const { url, responseHeaders, statusCode } = details;
 
+    // 仅缓存成功的请求
     if (!url || statusCode !== 200) {
       return;
     }
@@ -176,22 +149,41 @@ const createWindow = async () => {
       parsedUrl.pathname || '',
       parsedUrl.query,
     );
+    const cachePath = path.join(
+      CACHE_DIR,
+      `${cacheKey.replace(/[^a-z0-9]/gi, '_')}`,
+    );
 
     // 自定义网络请求获取响应体
     fetch(url)
-      .then((res) => res.text())
-      .then((body) => {
-        // 存入缓存
-        cacheDb.insert(
-          { key: cacheKey, data: { headers: responseHeaders || {}, body } },
-          (err) => {
-            if (err) console.error('Cache insert error:', err);
-            else console.log('Response cached:', url);
-          },
-        );
+      .then((res) => {
+        const contentType = res.headers.get('content-type');
+
+        if (contentType?.includes('application/json')) {
+          return res
+            .json()
+            .then((body) => ({ body: JSON.stringify(body), contentType }));
+        }
+        if (contentType?.includes('text')) {
+          return res.text().then((body) => ({ body, contentType }));
+        }
+        if (contentType?.includes('image') || contentType?.includes('font')) {
+          return res.arrayBuffer().then((body) => ({
+            body: Buffer.from(body),
+            contentType,
+          }));
+        }
+
+        throw new Error('Unsupported content type');
+      })
+      .then(({ body, contentType }) => {
+        if (body) {
+          fs.writeFileSync(cachePath, body); // 缓存内容写入文件
+          console.log('Response cached:', url);
+        }
       })
       .catch((err) => {
-        console.error('Error fetching response body:', err);
+        console.error('Error caching response:', err);
       });
   });
 };

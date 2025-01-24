@@ -93,49 +93,75 @@ const createWindow = async () => {
     // 返回文件路径
     callback({ path: filePath });
   });
+  const filter = {
+    urls: ['*://*/*'], // 过滤所有请求
+  };
 
   // 设置网络拦截器
-  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
-    const { url } = details;
-    // 忽略非 http/https 请求
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      callback({});
-      return;
-    }
-    const parsedUrl = parse(url || '', true);
-
-    if (!parsedUrl.pathname) {
-      callback({});
-      return;
-    }
-
-    const cacheKey = generateCacheKey(parsedUrl.pathname, parsedUrl.query);
-
-    // 查找缓存
-    cacheDb.findOne({ key: cacheKey }, (err, doc) => {
-      if (err) {
-        console.error('Cache query error:', err);
+  session.defaultSession.webRequest.onBeforeRequest(
+    filter,
+    (details, callback) => {
+      const { url } = details;
+      // 忽略非 http/https 请求
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
         callback({});
         return;
       }
-
-      if (doc) {
-        // 缓存命中 - 伪造响应
-        console.log('Cache hit:', url);
-
-        const localPath = path.join(
-          app.getPath('userData'),
-          `${cacheKey.replace(/[^a-z0-9]/gi, '_')}.html`,
-        );
-        fs.writeFileSync(localPath, doc.data.body); // 写入缓存到本地文件
-
-        callback({ cancel: true, redirectURL: `file://${localPath}` }); // 使用本地文件作为响应
-      } else {
-        console.log('Cache miss:', url);
-        callback({});
+      // 不拦截主页面加载请求（通常是 HTML 文档）
+      if (details.resourceType === 'mainFrame') {
+        callback({}); // 允许直接加载
+        return;
       }
-    });
-  });
+      const parsedUrl = parse(url || '', true);
+
+      if (!parsedUrl.pathname) {
+        callback({});
+        return;
+      }
+      // // 拦截接口请求（例如以 /api 开头）
+      // if (url.includes('/api')) {
+      //   console.log('Intercepting API request:', url);
+      //   // 自定义逻辑（缓存、重定向等）
+      //   callback({});
+      //   return;
+      // }
+
+      // // 拦截静态资源请求（CSS、图片等）
+      // if (/\.(css|js|png|jpe?g|gif|svg|woff2?|ttf|eot|ico)$/i.test(url)) {
+      //   console.log('Intercepting static resource:', url);
+      //   // 自定义逻辑（缓存、重定向等）
+      //   callback({});
+      //   return;
+      // }
+
+      const cacheKey = generateCacheKey(parsedUrl.pathname, parsedUrl.query);
+
+      // 查找缓存
+      cacheDb.findOne({ key: cacheKey }, (err, doc) => {
+        if (err) {
+          console.error('Cache query error:', err);
+          callback({});
+          return;
+        }
+
+        if (doc) {
+          // 缓存命中 - 伪造响应
+          console.log('Cache hit:', url);
+
+          const localPath = path.join(
+            app.getPath('userData'),
+            `${cacheKey.replace(/[^a-z0-9]/gi, '_')}.html`,
+          );
+          fs.writeFileSync(localPath, doc.data.body); // 写入缓存到本地文件
+
+          callback({ cancel: true, redirectURL: `file://${localPath}` }); // 使用本地文件作为响应
+        } else {
+          console.log('Cache miss:', url);
+          callback({});
+        }
+      });
+    },
+  );
 
   // 在请求完成后缓存数据
   session.defaultSession.webRequest.onCompleted((details) => {

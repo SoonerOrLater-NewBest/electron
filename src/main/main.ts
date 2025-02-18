@@ -1,26 +1,37 @@
 import path from 'path';
 import { app, BrowserWindow, session, protocol } from 'electron';
-import fs from 'fs';
+import Datastore from 'nedb';
 import { parse } from 'url';
-import crypto from 'crypto';
+import fs from 'fs';
+import fetch from 'node-fetch'; // 确保你已经安装了 node-fetch 模块
 
 let mainWindow: BrowserWindow | null = null;
 
-// **1. 缓存目录**
-const CACHE_DIR = path.join(app.getPath('userData'), 'image_cache');
+// 初始化缓存数据库
+const cacheDb = new Datastore<{
+  key: string;
+  data: { headers: Record<string, string>; body: string };
+}>({
+  filename: path.join(app.getPath('userData'), 'cache.db'),
+  autoload: true,
+});
 
-// 确保缓存目录存在
+// 缓存文件目录
+const CACHE_DIR = path.join(app.getPath('userData'), 'cache');
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
-  console.log(`📁 Created image cache directory: ${CACHE_DIR}`);
 }
 
-// **2. 生成唯一 cache key**
+// 生成缓存键
 const generateCacheKey = (url: string) => {
-  return crypto.createHash('md5').update(url).digest('hex') + path.extname(url);
+  return encodeURIComponent(url.replace(/[^\w\s]/gi, '_')); // URL 编码并清理非法字符
 };
 
-// **3. Electron 窗口**
+// 从 URL 获取扩展名
+const getFileExtensionFromUrl = (url: string): string => {
+  return path.extname(url).toLowerCase() || '.jpg'; // 默认使用 .jpg 扩展名，如果 URL 没有扩展名
+};
+
 const createWindow = async () => {
   mainWindow = new BrowserWindow({
     show: false,
@@ -29,11 +40,11 @@ const createWindow = async () => {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      webSecurity: false, // **调试时可禁用安全策略**
     },
   });
 
-  mainWindow.loadURL('https://www.baidu.com');
+  // 加载 URL
+  mainWindow.loadURL('http://www.baidu.com');
 
   mainWindow.on('ready-to-show', () => {
     if (mainWindow) mainWindow.show();
@@ -43,90 +54,84 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  mainWindow.webContents.on(
-    'did-fail-load',
-    (event, errorCode, errorDescription, validatedURL) => {
-      console.error('❌ Navigation failed:', validatedURL, errorDescription);
-    },
-  );
-
-  // **注册 file:// 协议**
+  // 注册 file:// 协议
   protocol.registerFileProtocol('file', (request, callback) => {
-    const filePath = decodeURIComponent(request.url.replace('file:///', ''));
-    console.log(`📄 Serving local file: ${filePath}`);
+    const filePath = decodeURIComponent(request.url.substr(7)); // 去掉 "file://"
     callback({ path: filePath });
   });
 
-  // **4. 拦截并缓存图片**
+  // 设置网络拦截器
   session.defaultSession.webRequest.onBeforeRequest(
     { urls: ['*://*/*'] },
     (details, callback) => {
       const { url, resourceType } = details;
 
+      // 忽略非 HTTP/HTTPS 请求
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
         callback({});
         return;
       }
 
-      // **仅拦截图片请求**
+      // 仅拦截图片请求
       if (
         resourceType === 'image' ||
         /\.(png|jpe?g|gif|svg|webp)$/i.test(url)
       ) {
         const cacheKey = generateCacheKey(url);
-        const cachePath = path.join(CACHE_DIR, cacheKey);
+        const fileExtension = getFileExtensionFromUrl(url); // 从 URL 中提取扩展名
+        const cachePath = path.join(CACHE_DIR, `${cacheKey}${fileExtension}`);
 
+        // 检查缓存
         if (fs.existsSync(cachePath)) {
-          console.log(`✅ Cache HIT for image: ${url}`);
+          console.log(`✅ Cache hit for image: ${url}`);
           callback({ cancel: true, redirectURL: `file://${cachePath}` });
-          return;
         } else {
-          console.log(`🚀 Cache MISS for image: ${url}`);
+          console.log(`🚀 Cache miss for image: ${url}`);
+          callback({});
         }
+      } else {
+        callback({});
       }
-
-      callback({});
     },
   );
 
-  // **5. 在请求完成后缓存图片**
-  session.defaultSession.webRequest.onCompleted(
-    { urls: ['*://*/*'] },
-    async (details) => {
-      const { url, statusCode, responseHeaders, resourceType } = details;
+  // 在请求完成后缓存数据
+  session.defaultSession.webRequest.onCompleted((details) => {
+    const { url, responseHeaders, statusCode, resourceType } = details;
 
-      if (!url || statusCode !== 200) return;
+    if (!url || statusCode !== 200) return;
 
-      // **只缓存图片**
-      if (
-        resourceType === 'image' ||
-        /\.(png|jpe?g|gif|svg|webp)$/i.test(url)
-      ) {
-        const cacheKey = generateCacheKey(url);
-        const cachePath = path.join(CACHE_DIR, cacheKey);
+    // 仅缓存图片
+    if (resourceType === 'image' || /\.(png|jpe?g|gif|svg|webp)$/i.test(url)) {
+      const cacheKey = generateCacheKey(url);
+      const contentType = responseHeaders['content-type'] || '';
+      const fileExtension = getFileExtensionFromUrl(url); // 从 URL 提取扩展名
+      const cachePath = path.join(CACHE_DIR, `${cacheKey}${fileExtension}`);
 
-        // **如果文件已存在，则不重复下载**
-        if (fs.existsSync(cachePath)) {
-          console.log(`🔹 Image already cached, skipping download: ${url}`);
-          return;
-        }
+      // 如果文件已存在，则不重复下载
+      if (fs.existsSync(cachePath)) {
+        console.log(`🔹 Image already cached, skipping download: ${url}`);
+        return;
+      }
 
-        console.log(`⬇️ Fetching and caching image: ${url}`);
+      console.log(`⬇️ Fetching and caching image: ${url}`);
 
-        try {
-          const res = await fetch(url);
-          const buffer = await res.arrayBuffer();
-          fs.writeFileSync(cachePath, Buffer.from(buffer));
+      // 缓存图片
+      fetch(url)
+        .then((res) => res.arrayBuffer())
+        .then((buffer) => {
+          fs.writeFileSync(cachePath, Buffer.from(buffer)); // 写入缓存
           console.log(`✅ Image cached at: ${cachePath}`);
-        } catch (error) {
-          console.error(`❌ Failed to cache image ${url}:`, error);
-        }
-      }
-    },
-  );
+        })
+        .catch((err) => {
+          console.error(`❌ Failed to cache image ${url}:`, err);
+        });
+    }
+  });
 };
 
-app.whenReady().then(createWindow);
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+app.whenReady().then(createWindow).catch(console.log);

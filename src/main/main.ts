@@ -1,9 +1,8 @@
 import path from 'path';
 import { app, BrowserWindow, session, protocol } from 'electron';
 import Datastore from 'nedb';
-import { parse } from 'url';
 import fs from 'fs';
-import fetch from 'node-fetch'; // 确保你已经安装了 node-fetch 模块
+import { parse } from 'url';
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -16,21 +15,15 @@ const cacheDb = new Datastore<{
   autoload: true,
 });
 
-// 缓存文件目录
 const CACHE_DIR = path.join(app.getPath('userData'), 'cache');
+
+// 创建缓存目录（如果不存在）
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
-// 生成缓存键
-const generateCacheKey = (url: string) => {
-  return encodeURIComponent(url.replace(/[^\w\s]/gi, '_')); // URL 编码并清理非法字符
-};
-
-// 从 URL 获取扩展名
-const getFileExtensionFromUrl = (url: string): string => {
-  return path.extname(url).toLowerCase() || '.jpg'; // 默认使用 .jpg 扩展名，如果 URL 没有扩展名
-};
+const generateCacheKey = (pathname: string, query: Record<string, any>) =>
+  `${pathname}?${new URLSearchParams(query).toString()}`;
 
 const createWindow = async () => {
   mainWindow = new BrowserWindow({
@@ -43,7 +36,6 @@ const createWindow = async () => {
     },
   });
 
-  // 加载 URL
   mainWindow.loadURL('http://www.baidu.com');
 
   mainWindow.on('ready-to-show', () => {
@@ -54,10 +46,30 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  // 注册 file:// 协议
-  protocol.registerFileProtocol('file', (request, callback) => {
-    const filePath = decodeURIComponent(request.url.substr(7)); // 去掉 "file://"
-    callback({ path: filePath });
+  // 注册自定义协议 cache:// 协议
+  protocol.registerHttpProtocol('cache', (request, callback) => {
+    const cacheUrl = request.url;
+    const filePath = path.normalize(decodeURIComponent(cacheUrl.substr(7))); // 去掉 "cache://"
+
+    console.log('Serving cached file from:', filePath);
+
+    // 检查缓存文件是否存在
+    if (fs.existsSync(filePath)) {
+      console.log(`Found cached file at: ${filePath}`);
+      callback({
+        statusCode: 200,
+        headers: {
+          'Content-Type': 'image/jpeg', // 你可以根据实际的文件类型修改
+        },
+        data: fs.readFileSync(filePath), // 返回缓存文件内容
+      });
+    } else {
+      console.log(`File not found in cache: ${filePath}`);
+      callback({
+        statusCode: 404,
+        data: Buffer.from('Not Found'), // 文件未找到时的返回内容
+      });
+    }
   });
 
   // 设置网络拦截器
@@ -72,24 +84,32 @@ const createWindow = async () => {
         return;
       }
 
-      // 仅拦截图片请求
-      if (
-        resourceType === 'image' ||
-        /\.(png|jpe?g|gif|svg|webp)$/i.test(url)
-      ) {
-        const cacheKey = generateCacheKey(url);
-        const fileExtension = getFileExtensionFromUrl(url); // 从 URL 中提取扩展名
-        const cachePath = path.join(CACHE_DIR, `${cacheKey}${fileExtension}`);
+      // 不拦截主页面加载请求
+      if (resourceType === 'mainFrame') {
+        callback({});
+        return;
+      }
 
-        // 检查缓存
-        if (fs.existsSync(cachePath)) {
-          console.log(`✅ Cache hit for image: ${url}`);
-          callback({ cancel: true, redirectURL: `file://${cachePath}` });
-        } else {
-          console.log(`🚀 Cache miss for image: ${url}`);
-          callback({});
-        }
+      const parsedUrl = parse(url, true);
+      if (!parsedUrl.pathname) {
+        callback({});
+        return;
+      }
+
+      const cacheKey = generateCacheKey(parsedUrl.pathname, parsedUrl.query);
+      const cachePath = path.join(
+        CACHE_DIR,
+        `${cacheKey.replace(/[^a-z0-9]/gi, '_')}`,
+      );
+
+      // 检查缓存
+      if (fs.existsSync(cachePath)) {
+        console.log('Cache hit for image:', url);
+
+        // 使用自定义协议返回缓存文件
+        callback({ cancel: true, redirectURL: `cache://${cachePath}` });
       } else {
+        console.log('Cache miss:', url);
         callback({});
       }
     },
@@ -97,36 +117,54 @@ const createWindow = async () => {
 
   // 在请求完成后缓存数据
   session.defaultSession.webRequest.onCompleted((details) => {
-    const { url, responseHeaders, statusCode, resourceType } = details;
+    const { url, responseHeaders, statusCode } = details;
 
-    if (!url || statusCode !== 200) return;
-
-    // 仅缓存图片
-    if (resourceType === 'image' || /\.(png|jpe?g|gif|svg|webp)$/i.test(url)) {
-      const cacheKey = generateCacheKey(url);
-      const contentType = responseHeaders['content-type'] || '';
-      const fileExtension = getFileExtensionFromUrl(url); // 从 URL 提取扩展名
-      const cachePath = path.join(CACHE_DIR, `${cacheKey}${fileExtension}`);
-
-      // 如果文件已存在，则不重复下载
-      if (fs.existsSync(cachePath)) {
-        console.log(`🔹 Image already cached, skipping download: ${url}`);
-        return;
-      }
-
-      console.log(`⬇️ Fetching and caching image: ${url}`);
-
-      // 缓存图片
-      fetch(url)
-        .then((res) => res.arrayBuffer())
-        .then((buffer) => {
-          fs.writeFileSync(cachePath, Buffer.from(buffer)); // 写入缓存
-          console.log(`✅ Image cached at: ${cachePath}`);
-        })
-        .catch((err) => {
-          console.error(`❌ Failed to cache image ${url}:`, err);
-        });
+    // 仅缓存成功的请求
+    if (!url || statusCode !== 200) {
+      return;
     }
+
+    const parsedUrl = parse(url, true);
+    const cacheKey = generateCacheKey(
+      parsedUrl.pathname || '',
+      parsedUrl.query,
+    );
+    const cachePath = path.join(
+      CACHE_DIR,
+      `${cacheKey.replace(/[^a-z0-9]/gi, '_')}`,
+    );
+
+    // 自定义网络请求获取响应体
+    fetch(url)
+      .then((res) => {
+        const contentType = res.headers.get('content-type');
+
+        if (contentType?.includes('application/json')) {
+          return res
+            .json()
+            .then((body) => ({ body: JSON.stringify(body), contentType }));
+        }
+        if (contentType?.includes('text')) {
+          return res.text().then((body) => ({ body, contentType }));
+        }
+        if (contentType?.includes('image') || contentType?.includes('font')) {
+          return res.arrayBuffer().then((body) => ({
+            body: Buffer.from(body),
+            contentType,
+          }));
+        }
+
+        throw new Error('Unsupported content type');
+      })
+      .then(({ body, contentType }) => {
+        if (body) {
+          fs.writeFileSync(cachePath, body); // 缓存内容写入文件
+          console.log('Response cached:', url);
+        }
+      })
+      .catch((err) => {
+        console.error('Error caching response:', err);
+      });
   });
 };
 

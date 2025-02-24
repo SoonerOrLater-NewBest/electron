@@ -4,6 +4,7 @@ const fs = require('fs');
 const url = require('url');
 const https = require('https');
 const http = require('http');
+const mime = require('mime'); // 用于 MIME 类型检测
 const imageCacheServer = require('./imageCacheServer'); // 引入自定义的缓存服务器
 
 const userDataPath = app.getPath('userData');
@@ -26,7 +27,7 @@ function createWindow() {
   });
 
   // 加载指定的网页
-  win.loadURL('https://www.baidu.com');
+  win.loadURL('http://www.aizzc.top');
 
   // 拦截图片请求
   const filter = {
@@ -43,16 +44,19 @@ function createWindow() {
 
       const requestedUrl = details.url;
       const fileName = path.basename(url.parse(requestedUrl).pathname);
-      const localPath = path.join(imageCacheDir, fileName);
+      const localPath = path.resolve(imageCacheDir, fileName); // 生成绝对路径
+
+      // 如果路径中有 URL 编码的字符，需要解码
+      const decodedLocalPath = decodeURIComponent(localPath);
 
       // 检查是否本地已有图片缓存
-      if (fs.existsSync(localPath)) {
+      if (fs.existsSync(decodedLocalPath)) {
         // 本地存在，返回通过 HTTP 服务器加载的图片
         const localFileUrl = `http://localhost:3000/${fileName}`;
         callback({ cancel: false, redirectURL: localFileUrl });
       } else {
         // 本地不存在，允许请求并下载图片到本地
-        downloadImage(requestedUrl, localPath, () => {
+        downloadImage(requestedUrl, decodedLocalPath, () => {
           // 下载完成后，再次尝试加载
           const localFileUrl = `http://localhost:3000/${fileName}`;
           callback({ cancel: false, redirectURL: localFileUrl });

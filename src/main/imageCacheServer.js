@@ -18,10 +18,14 @@ const imageCache = {};
 
 // 启动 HTTP 服务器，提供图片缓存
 const server = http.createServer((req, res) => {
+  // 添加 CORS 头部，允许所有源的请求
+  res.setHeader('Access-Control-Allow-Origin', '*'); // 允许所有域名跨域访问
+  res.setHeader('Access-Control-Allow-Methods', 'GET'); // 允许的请求方法
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); // 允许的请求头
+
   const requestedUrl = decodeURIComponent(req.url); // 解码请求路径
   const fileName = path.basename(requestedUrl);
   const filePath = path.join(imageCacheDir, fileName);
-  console.log('filePath:', filePath); // 打印请求的文件名
 
   console.log('Received request for:', fileName); // 打印请求的文件名
 

@@ -1,22 +1,20 @@
-const { app, BrowserWindow, session } = require('electron');
-const path = require('path');
-const fs = require('fs');
-const https = require('https');
-const http = require('http');
-const mime = require('mime');
-const axios = require('axios'); // 用于请求图片
+import { app, BrowserWindow, session } from 'electron';
+import Nedb from 'nedb';
+import path from 'path';
+import fs from 'fs';
+import https from 'https';
+import axios from 'axios';
+import { IncomingMessage } from 'http';
 
+// 初始化 Nedb 数据库，存储 API 响应数据
 const userDataPath = app.getPath('userData');
-const imageCacheDir = path.join(userDataPath, 'imageCache');
+const apiCachePath = path.join(userDataPath, 'apiCache.db');
+const db = new Nedb({ filename: apiCachePath, autoload: true });
 
-// 创建缓存目录（如果不存在）
-if (!fs.existsSync(imageCacheDir)) {
-  fs.mkdirSync(imageCacheDir);
-}
+// 创建浏览器窗口
+let win: BrowserWindow;
 
-let win;
-
-function createWindow() {
+function createWindow(): void {
   win = new BrowserWindow({
     width: 800,
     height: 600,
@@ -25,83 +23,151 @@ function createWindow() {
     },
   });
 
-  // 加载指定的网页
+  // 加载指定网页
   win.loadURL('https://www.baidu.com');
 
-  // 拦截图片请求
+  // 拦截所有请求，包含图片请求和API请求
   const filter = {
-    urls: ['*://*/*.jpg', '*://*/*.jpeg', '*://*/*.png', '*://*/*.gif'],
+    urls: ['*://*/*'], // 匹配所有请求
   };
 
   session.defaultSession.webRequest.onBeforeRequest(
     filter,
     (details, callback) => {
-      const requestedUrl = details.url;
-      const fileName = path.basename(requestedUrl);
-      const localPath = path.resolve(imageCacheDir, fileName); // 生成绝对路径
+      const url = details.url;
+      const resourceType = details.resourceType;
+      const queryParams = new URL(url).searchParams.toString(); // 获取请求的查询参数
+      const uniqueKey =
+        resourceType === 'image'
+          ? getImageCacheKey(url)
+          : getApiCacheKey(url, queryParams);
 
-      const decodedLocalPath = decodeURIComponent(localPath);
-
-      console.log(`Requested image: ${requestedUrl}`);
-      console.log(`Checking local path: ${decodedLocalPath}`);
-
-      // 检查是否本地已有图片缓存
-      if (fs.existsSync(decodedLocalPath)) {
-        // 本地缓存存在，直接从本地读取并返回图片
-        console.log(`Serving from local cache: ${fileName}`);
-        fs.readFile(decodedLocalPath, (err, data) => {
-          if (err) {
-            console.error('Error reading cached image:', err);
-            callback({ cancel: true });
-            return;
-          }
-
-          // 将图片数据直接返回给浏览器
-          callback({
-            cancel: false,
-            responseHeaders: {
-              'Content-Type': mime.getType(decodedLocalPath),
-            },
-            data: data, // 直接传递图片数据
-          });
-        });
+      if (resourceType === 'image') {
+        handleImageRequest(url, uniqueKey, callback);
+      } else if (resourceType === 'xhr' || resourceType === 'fetch') {
+        handleApiRequest(url, uniqueKey, callback);
       } else {
-        // 本地没有缓存，下载图片
-        console.log(`Downloading image: ${requestedUrl}`);
-        downloadImage(requestedUrl, decodedLocalPath, () => {
-          // 下载完成后，再次读取并返回图片
-          console.log(`Serving newly downloaded image: ${fileName}`);
-          fs.readFile(decodedLocalPath, (err, data) => {
-            if (err) {
-              console.error('Error reading downloaded image:', err);
-              callback({ cancel: true });
-              return;
-            }
-
-            // 将图片数据直接返回给浏览器
-            callback({
-              cancel: false,
-              responseHeaders: {
-                'Content-Type': mime.getType(decodedLocalPath),
-              },
-              data: data, // 直接传递图片数据
-            });
-          });
-        });
+        callback({ cancel: false });
       }
     },
   );
 }
 
+// 处理图片请求
+function handleImageRequest(
+  url: string,
+  uniqueKey: string,
+  callback: (details: any) => void,
+): void {
+  const localPath = path.join(userDataPath, 'imageCache', uniqueKey);
+
+  if (fs.existsSync(localPath)) {
+    console.log(`Serving image from local cache: ${url}`);
+    fs.readFile(localPath, (err, data) => {
+      if (err) {
+        console.error('Error reading cached image:', err);
+        callback({ cancel: true });
+        return;
+      }
+
+      callback({
+        cancel: false,
+        responseHeaders: { 'Content-Type': 'image/jpeg' }, // 假设图片是 JPEG 格式
+        data: data,
+      });
+    });
+  } else {
+    downloadImage(url, localPath, () => {
+      fs.readFile(localPath, (err, data) => {
+        if (err) {
+          console.error('Error reading downloaded image:', err);
+          callback({ cancel: true });
+          return;
+        }
+
+        callback({
+          cancel: false,
+          responseHeaders: { 'Content-Type': 'image/jpeg' },
+          data: data,
+        });
+      });
+    });
+  }
+}
+
+// 处理 API 请求
+function handleApiRequest(
+  url: string,
+  uniqueKey: string,
+  callback: (details: any) => void,
+): void {
+  console.log(`Intercepted API request: ${url}`);
+  db.findOne({ key: uniqueKey }, (err, doc) => {
+    if (err) {
+      console.error('Error querying Nedb:', err);
+      callback({ cancel: false });
+      return;
+    }
+
+    if (doc) {
+      console.log('Returning cached API data from Nedb');
+      callback({
+        cancel: false,
+        responseHeaders: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(doc.data),
+      });
+    } else {
+      console.log('No cached data, making network request');
+      axios
+        .get(url)
+        .then((response) => {
+          const data = response.data;
+          db.insert({ key: uniqueKey, data: data }, (err) => {
+            if (err) {
+              console.error('Error saving data to Nedb:', err);
+            }
+            console.log('API data saved to Nedb');
+          });
+
+          callback({
+            cancel: false,
+            responseHeaders: { 'Content-Type': 'application/json' },
+            data: JSON.stringify(data),
+          });
+        })
+        .catch((error) => {
+          console.error('API request failed:', error);
+          callback({ cancel: true });
+        });
+    }
+  });
+}
+
+// 生成唯一的缓存 Key (图片请求)
+function getImageCacheKey(url: string): string {
+  const filename = path.basename(url);
+  return filename; // 对于图片，直接使用文件名作为唯一标识
+}
+
+// 生成唯一的缓存 Key (API 请求，包含请求入参)
+function getApiCacheKey(url: string, queryParams: string): string {
+  // 使用 URL 和查询参数（如果有）结合来确保唯一性
+  return `${url}?${queryParams}`;
+}
+
 // 下载图片并保存到本地
-function downloadImage(imageUrl, localPath, callback) {
+function downloadImage(
+  imageUrl: string,
+  localPath: string,
+  callback: () => void,
+): void {
   const fileStream = fs.createWriteStream(localPath);
 
-  const protocol = imageUrl.startsWith('https') ? https : http;
+  const protocol = imageUrl.startsWith('https') ? https : require('http');
 
   protocol
-    .get(imageUrl, (res) => {
-      console.log(`Downloading: ${imageUrl}`);
+    .get(imageUrl, (res: IncomingMessage) => {
+      console.log(`Downloading image: ${imageUrl}`);
 
       // 确保下载成功并保存文件
       res.pipe(fileStream);
@@ -112,48 +178,10 @@ function downloadImage(imageUrl, localPath, callback) {
         callback(); // 下载完成后回调
       });
     })
-    .on('error', (err) => {
+    .on('error', (err: Error) => {
       console.error('下载图片失败:', err);
     });
 }
-
-// 创建本地 HTTP 服务器，代理图片请求
-const imageCacheServer = http.createServer((req, res) => {
-  // 设置 CORS 头部，允许浏览器跨域访问本地图片
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  const requestedUrl = decodeURIComponent(req.url); // 解码请求路径
-  const fileName = path.basename(requestedUrl);
-  const filePath = path.join(imageCacheDir, fileName);
-
-  console.log('Received request for:', fileName);
-
-  if (fs.existsSync(filePath)) {
-    console.log(`Serving from disk cache: ${fileName}`);
-    fs.readFile(filePath, (err, data) => {
-      if (err) {
-        res.writeHead(500);
-        res.end('Error reading cached image');
-        return;
-      }
-
-      // 返回缓存的图片
-      res.writeHead(200, { 'Content-Type': mime.getType(filePath) });
-      res.end(data);
-    });
-  } else {
-    res.writeHead(404);
-    res.end('Image not found');
-  }
-});
-
-// 启动 HTTP 服务器，监听 3000 端口
-const port = 3000;
-imageCacheServer.listen(port, () => {
-  console.log(`Image cache server running at http://localhost:${port}`);
-});
 
 app.whenReady().then(() => {
   createWindow();

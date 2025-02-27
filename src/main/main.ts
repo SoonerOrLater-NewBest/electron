@@ -51,6 +51,37 @@ function createWindow(): void {
       }
     },
   );
+  // 使用 onCompleted 捕获响应数据并缓存
+  session.defaultSession.webRequest.onCompleted((details) => {
+    const url = details.url;
+    const method = details.method;
+    const resourceType = details.resourceType;
+    const statusCode = details.statusCode;
+
+    if (
+      (resourceType === 'xhr' || resourceType === 'fetch') &&
+      statusCode === 200
+    ) {
+      const uniqueKey = getApiCacheKey(
+        url,
+        details.uploadData ? details.uploadData[0].bytes.toString() : '',
+      );
+
+      // 获取响应内容
+      details.responseBody?.then((data) => {
+        if (data) {
+          const responseData = JSON.parse(data.toString());
+          // 将响应数据保存到本地数据库
+          db.insert({ key: uniqueKey, data: responseData }, (err) => {
+            if (err) {
+              console.error('Error saving data to Nedb:', err);
+            }
+            console.log('API response data saved to Nedb');
+          });
+        }
+      });
+    }
+  });
 }
 
 // 处理图片请求

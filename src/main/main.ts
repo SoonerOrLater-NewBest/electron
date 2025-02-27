@@ -3,15 +3,12 @@ import Nedb from 'nedb';
 import path from 'path';
 import fs from 'fs';
 import https from 'https';
-import axios from 'axios';
-import { IncomingMessage } from 'http';
+import http from 'http';
 
-// 初始化 Nedb 数据库，存储 API 响应数据
 const userDataPath = app.getPath('userData');
 const apiCachePath = path.join(userDataPath, 'apiCache.db');
 const db = new Nedb({ filename: apiCachePath, autoload: true });
 
-// 创建浏览器窗口
 let win: BrowserWindow;
 
 function createWindow(): void {
@@ -23,41 +20,59 @@ function createWindow(): void {
     },
   });
 
-  // 加载指定网页
   win.loadURL('https://www.baidu.com');
 
-  // 拦截所有请求，包含图片请求和API请求
+  // 拦截所有请求，包括POST、XHR等
   const filter = {
-    urls: ['*://*/*'], // 匹配所有请求
+    urls: ['*://*/*'],
   };
 
+  // 在 onBeforeRequest 中拦截请求
   session.defaultSession.webRequest.onBeforeRequest(
     filter,
     (details, callback) => {
       const url = details.url;
+      const method = details.method;
       const resourceType = details.resourceType;
-      const queryParams = new URL(url).searchParams.toString(); // 获取请求的查询参数
-      const uniqueKey =
-        resourceType === 'image'
-          ? getImageCacheKey(url)
-          : getApiCacheKey(url, queryParams);
+      const body = details.uploadData
+        ? details.uploadData[0].bytes.toString()
+        : null;
 
-      if (resourceType === 'image') {
-        handleImageRequest(url, uniqueKey, callback);
-      } else if (resourceType === 'xhr' || resourceType === 'fetch') {
-        handleApiRequest(url, uniqueKey, callback);
-      } else {
-        callback({ cancel: false });
+      // 如果是 API 请求 (POST)，我们处理它
+      if (resourceType === 'xhr' || resourceType === 'fetch') {
+        if (method === 'POST' && body) {
+          const uniqueKey = getApiCacheKey(url, body);
+
+          // 查找缓存
+          db.findOne({ key: uniqueKey }, (err, doc) => {
+            if (err) {
+              console.error('Error querying Nedb:', err);
+            } else if (doc) {
+              // 如果缓存存在，返回缓存数据
+              console.log('Returning cached data from Nedb');
+              callback({
+                cancel: false,
+                responseHeaders: { 'Content-Type': 'application/json' },
+                data: JSON.stringify(doc.data),
+              });
+              return;
+            }
+          });
+        }
       }
+
+      callback({ cancel: false });
     },
   );
-  // 使用 onCompleted 捕获响应数据并缓存
+
+  // 拦截响应并保存
   session.defaultSession.webRequest.onCompleted((details) => {
     const url = details.url;
     const method = details.method;
     const resourceType = details.resourceType;
     const statusCode = details.statusCode;
 
+    // 对于 API 请求（POST 请求）并且响应是成功的（状态码 200）
     if (
       (resourceType === 'xhr' || resourceType === 'fetch') &&
       statusCode === 200
@@ -67,11 +82,10 @@ function createWindow(): void {
         details.uploadData ? details.uploadData[0].bytes.toString() : '',
       );
 
-      // 获取响应内容
-      details.responseBody?.then((data) => {
-        if (data) {
-          const responseData = JSON.parse(data.toString());
-          // 将响应数据保存到本地数据库
+      // 使用模拟的 POST 请求获取响应
+      sendPostRequest(url, details.uploadData, (responseData) => {
+        if (responseData) {
+          // 保存到 Nedb 数据库
           db.insert({ key: uniqueKey, data: responseData }, (err) => {
             if (err) {
               console.error('Error saving data to Nedb:', err);
@@ -84,155 +98,60 @@ function createWindow(): void {
   });
 }
 
-// 处理图片请求
-function handleImageRequest(
+// 模拟 POST 请求并获取响应
+function sendPostRequest(
   url: string,
-  uniqueKey: string,
-  callback: (details: any) => void,
+  postData: any,
+  callback: (data: any) => void,
 ): void {
-  const localPath = path.join(userDataPath, 'imageCache', uniqueKey);
+  const postDataStr = postData[0].bytes.toString();
+  const data = JSON.parse(postDataStr); // 解析请求体数据
 
-  if (fs.existsSync(localPath)) {
-    console.log(`Serving image from local cache: ${url}`);
-    fs.readFile(localPath, (err, data) => {
-      if (err) {
-        console.error('Error reading cached image:', err);
-        callback({ cancel: true });
-        return;
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postDataStr),
+    },
+  };
+
+  const protocol = url.startsWith('https') ? https : http;
+
+  const req = protocol.request(url, options, (res) => {
+    let responseData = '';
+    res.on('data', (chunk) => {
+      responseData += chunk;
+    });
+
+    res.on('end', () => {
+      try {
+        const parsedData = JSON.parse(responseData);
+        callback(parsedData);
+      } catch (err) {
+        console.error('Error parsing response data:', err);
+        callback(null);
       }
-
-      callback({
-        cancel: false,
-        responseHeaders: { 'Content-Type': 'image/jpeg' }, // 假设图片是 JPEG 格式
-        data: data,
-      });
     });
-  } else {
-    downloadImage(url, localPath, () => {
-      fs.readFile(localPath, (err, data) => {
-        if (err) {
-          console.error('Error reading downloaded image:', err);
-          callback({ cancel: true });
-          return;
-        }
-
-        callback({
-          cancel: false,
-          responseHeaders: { 'Content-Type': 'image/jpeg' },
-          data: data,
-        });
-      });
-    });
-  }
-}
-
-// 处理 API 请求
-function handleApiRequest(
-  url: string,
-  uniqueKey: string,
-  callback: (details: any) => void,
-): void {
-  console.log(`Intercepted API request: ${url}`);
-  db.findOne({ key: uniqueKey }, (err, doc) => {
-    if (err) {
-      console.error('Error querying Nedb:', err);
-      callback({ cancel: false });
-      return;
-    }
-
-    if (doc) {
-      console.log('Returning cached API data from Nedb');
-      callback({
-        cancel: false,
-        responseHeaders: { 'Content-Type': 'application/json' },
-        data: JSON.stringify(doc.data),
-      });
-    } else {
-      console.log('No cached data, making network request');
-      const apiProtocol = url.startsWith('https') ? https : http;
-
-      apiProtocol
-        .get(url, (res: IncomingMessage) => {
-          let data = '';
-          res.on('data', (chunk) => {
-            data += chunk;
-          });
-
-          res.on('end', () => {
-            try {
-              const responseData = JSON.parse(data);
-              if (responseData) {
-                // 将响应数据保存到本地数据库
-                db.insert({ key: uniqueKey, data: responseData }, (err) => {
-                  if (err) {
-                    console.error('Error saving data to Nedb:', err);
-                  }
-                  console.log('API response data saved to Nedb');
-                  callback({
-                    cancel: false,
-                    responseHeaders: { 'Content-Type': 'application/json' },
-                    data: JSON.stringify(responseData),
-                  });
-                });
-              }
-            } catch (err) {
-              console.error('Error parsing response data:', err);
-              callback({ cancel: false });
-            }
-          });
-        })
-        .on('error', (err) => {
-          console.error('Error fetching response:', err);
-          callback({ cancel: false });
-        });
-    }
   });
-}
 
-// 生成唯一的缓存 Key (图片请求)
-function getImageCacheKey(url: string): string {
-  const filename = path.basename(url);
-  return filename; // 对于图片，直接使用文件名作为唯一标识
+  req.on('error', (err) => {
+    console.error('Error sending POST request:', err);
+    callback(null);
+  });
+
+  // 写入请求体
+  req.write(postDataStr);
+  req.end();
 }
 
 // 生成唯一的缓存 Key (API 请求，包含请求入参)
-function getApiCacheKey(url: string, queryParams: string): string {
-  // 使用 URL 和查询参数（如果有）结合来确保唯一性
-  return `${url}?${queryParams}`;
-}
-
-// 下载图片并保存到本地
-function downloadImage(
-  imageUrl: string,
-  localPath: string,
-  callback: () => void,
-): void {
-  const fileStream = fs.createWriteStream(localPath);
-
-  const protocol = imageUrl.startsWith('https') ? https : require('http');
-
-  protocol
-    .get(imageUrl, (res: IncomingMessage) => {
-      console.log(`Downloading image: ${imageUrl}`);
-
-      // 确保下载成功并保存文件
-      res.pipe(fileStream);
-
-      fileStream.on('finish', () => {
-        fileStream.close();
-        console.log(`Image saved to: ${localPath}`);
-        callback(); // 下载完成后回调
-      });
-    })
-    .on('error', (err: Error) => {
-      console.error('下载图片失败:', err);
-    });
+function getApiCacheKey(url: string, body: string): string {
+  return `${url}?${body}`;
 }
 
 app.whenReady().then(() => {
   createWindow();
 
-  // 在退出应用时关闭窗口
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
       app.quit();

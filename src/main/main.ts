@@ -149,26 +149,41 @@ function handleApiRequest(
       });
     } else {
       console.log('No cached data, making network request');
-      axios
-        .get(url)
-        .then((response) => {
-          const data = response.data;
-          db.insert({ key: uniqueKey, data: data }, (err) => {
-            if (err) {
-              console.error('Error saving data to Nedb:', err);
-            }
-            console.log('API data saved to Nedb');
+      const apiProtocol = url.startsWith('https') ? https : http;
+
+      apiProtocol
+        .get(url, (res: IncomingMessage) => {
+          let data = '';
+          res.on('data', (chunk) => {
+            data += chunk;
           });
 
-          callback({
-            cancel: false,
-            responseHeaders: { 'Content-Type': 'application/json' },
-            data: JSON.stringify(data),
+          res.on('end', () => {
+            try {
+              const responseData = JSON.parse(data);
+              if (responseData) {
+                // 将响应数据保存到本地数据库
+                db.insert({ key: uniqueKey, data: responseData }, (err) => {
+                  if (err) {
+                    console.error('Error saving data to Nedb:', err);
+                  }
+                  console.log('API response data saved to Nedb');
+                  callback({
+                    cancel: false,
+                    responseHeaders: { 'Content-Type': 'application/json' },
+                    data: JSON.stringify(responseData),
+                  });
+                });
+              }
+            } catch (err) {
+              console.error('Error parsing response data:', err);
+              callback({ cancel: false });
+            }
           });
         })
-        .catch((error) => {
-          console.error('API request failed:', error);
-          callback({ cancel: true });
+        .on('error', (err) => {
+          console.error('Error fetching response:', err);
+          callback({ cancel: false });
         });
     }
   });
